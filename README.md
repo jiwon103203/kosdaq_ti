@@ -16,7 +16,7 @@ python run_ti_forecast.py data/kosdaq150.xlsx --scenarios close_long --skip-grid
 pytest tests                                                         # 지표 식 · 미래 정보 미사용 · 분할 규칙
 ```
 
-입력은 DataGuide 엑셀(메타데이터 줄 뒤 `D A T E | 저가지수 | 고가지수 | 시가지수 | 종가지수`)이나 `date, open, high, low, close` csv입니다. 시가·고가·저가가 없는 날은 비워 두면 됩니다. 원본 데이터(DataGuide)는 라이선스 때문에 저장소에 넣지 않았습니다(`data/`, `*.xlsx`는 `.gitignore`).
+입력은 DataGuide 엑셀(메타데이터 줄 뒤 `D A T E | 저가지수 | 고가지수 | 시가지수 | 종가지수`)이나 `date, open, high, low, close` csv입니다. 시가·고가·저가가 없는 날은 비워 두면 됩니다.
 
 전체 실행(3 시나리오 × 9 예측기간 × 8 윈도우 × 2/3 클래스 × 3 모델 = 1,296개 학습 + 연도별 walk-forward)은 4코어에서 2~3시간 걸립니다. 대부분 SVM 격자 탐색(110개 조합 × 5 fold)이며, 끝난 학습은 `out/.../cache/`에 저장되어 다시 실행하면 재사용합니다.
 
