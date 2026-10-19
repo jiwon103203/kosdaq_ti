@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# 실행 결과 · 캐시 (results/ 는 정리한 결과만 커밋)
+out/
+
+# 원본 데이터 (DataGuide 등 라이선스 데이터는 커밋하지 않음)
+data/
+*.xlsx
