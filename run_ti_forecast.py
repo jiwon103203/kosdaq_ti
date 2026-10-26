@@ -4,6 +4,8 @@
     python run_ti_forecast.py data.xlsx                         # 그리드(논문 Table III–X) + walk-forward
     python run_ti_forecast.py data.xlsx --skip-wf --models svm  # 그리드만, SVM 만
     python run_ti_forecast.py data.xlsx --scenarios close_long --skip-grid
+    python run_ti_forecast.py data.xlsx --models rf,xgb,lgbm,logit,arima   # 트리 계열 · 계량 모형
+    python run_ti_forecast.py data.xlsx --models all --device cuda --ann-backend torch   # GPU
 
 결과 (``--out``, 기본 out/ti_forecast):
     summary.md                 데이터 · 분할 · 핵심 표
@@ -33,7 +35,7 @@ from ti_forecast.experiment import (HORIZONS, SCENARIOS, WINDOWS, best_by_horizo
                                     config_hash, grid_jobs, grid_metrics, grid_predictions, matched_window,
                                     performance_metrics, portfolio_table, prepare, run_jobs, tranche_backtest,
                                     walk_forward_jobs, walk_forward_metrics, walk_forward_predictions, window_pattern)
-from ti_forecast.models import MODELS
+from ti_forecast.models import MODELS, PAPER_MODELS, check_dependencies
 
 logger = logging.getLogger("run_ti_forecast")
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
@@ -46,6 +48,8 @@ def _ints(text: str):
 
 def _names(choices):
     def parse(text: str):
+        if text.strip() == "all":
+            return tuple(choices)
         names = tuple(x.strip() for x in text.split(",") if x.strip())
         bad = [n for n in names if n not in choices]
         if bad:
@@ -66,7 +70,8 @@ def build_parser() -> argparse.ArgumentParser:
     g = p.add_argument_group("실험")
     g.add_argument("--scenarios", type=_names(SCENARIOS), default=SCENARIOS,
                    help="ohlc_short = OHLC 지표 · close_short = 같은 기간 종가 전용 · close_long = 종가 전 기간")
-    g.add_argument("--models", type=_names(MODELS), default=MODELS)
+    g.add_argument("--models", type=_names(MODELS), default=PAPER_MODELS,
+                   help="논문 svm,ann,knn · 트리 rf,xgb,lgbm · 계량 logit,arima (쉼표로 여러 개, all = 전부)")
     g.add_argument("--horizons", type=_ints, default=HORIZONS, help="예측기간 s (거래일)")
     g.add_argument("--windows", type=_ints, default=WINDOWS, help="입력 윈도우 n (거래일)")
     g.add_argument("--classes", type=_ints, default=(2, 3), help="2 = Up/Down, 3 = Up/No Move/Down")
@@ -81,7 +86,16 @@ def build_parser() -> argparse.ArgumentParser:
     g = p.add_argument_group("모델")
     g.add_argument("--ann-seeds", type=int, default=5, help="ANN 시드 수 (확률 평균)")
     g.add_argument("--svm-max-iter", type=int, default=1_000_000, help="SVM solver 최대 반복")
-    g.add_argument("--n-jobs", type=int, default=os.cpu_count() or 1, help="병렬 작업 수")
+    g.add_argument("--n-jobs", type=int, default=os.cpu_count() or 1, help="병렬 작업 수 (CPU 작업)")
+
+    g = p.add_argument_group("가속 (GPU)")
+    g.add_argument("--device", choices=("cpu", "cuda"), default="cpu",
+                   help="cuda = xgb 와 --ann-backend torch 를 GPU 에서 학습")
+    g.add_argument("--ann-backend", choices=("sklearn", "torch"), default="sklearn",
+                   help="torch = 시드 전부를 한 번에 학습 (CPU 에서도 빠름, 결과 숫자는 sklearn 과 조금 다름)")
+    g.add_argument("--svm-backend", choices=("sklearn", "cuml"), default="sklearn",
+                   help="cuml = RAPIDS cuML GPU SVC 로 같은 격자 탐색")
+    g.add_argument("--gpu-jobs", type=int, default=1, help="GPU 작업을 동시에 돌릴 프로세스 수")
     g.add_argument("--no-cache", action="store_true", help="끝난 학습 결과를 캐시하지 않음")
 
     g = p.add_argument_group("포트폴리오 백테스트")
@@ -134,6 +148,14 @@ def run(args: argparse.Namespace) -> dict:
     scenarios = build_scenarios(df, args.scenarios)
     prepared = {sc.name: prepare(df, sc, args.windows, args.horizons, args.warmup) for sc in scenarios}
     model_kwargs = {"svm": {"max_iter": args.svm_max_iter}, "ann": {"seeds": tuple(range(args.ann_seeds))}}
+    # backend · device 는 캐시 폴더가 아니라 파일 이름에 붙는다 (cache_suffix) → 기본 설정이면 예전 캐시를 그대로 쓴다
+    runtime = {"svm": {"backend": args.svm_backend}, "xgb": {"device": args.device},
+               "ann": {"backend": args.ann_backend, **({"device": args.device} if args.ann_backend == "torch" else {})}}
+    fit_kwargs = {m: {**model_kwargs.get(m, {}), **runtime.get(m, {})} for m in MODELS}
+    check_dependencies(args.models, fit_kwargs)
+    if args.device == "cuda" and not any(m in args.models and fit_kwargs[m].get("device") == "cuda"
+                                         for m in ("xgb", "ann")):
+        logger.warning("--device cuda 는 xgb 와 --ann-backend torch 에만 쓰입니다 (지금 설정에서는 효과 없음)")
     cache_cfg = {"data": _file_sha1(args.input), "sheet": args.sheet, "start": args.start, "end": args.end,
                  "warmup": args.warmup, "test_frac": args.test_frac, "wf_min_train_years": args.wf_min_train_years,
                  "wf_train_years": args.wf_train_years, "model_kwargs": model_kwargs}
@@ -153,7 +175,7 @@ def run(args: argparse.Namespace) -> dict:
         logger.info("grid test period %s ~ %s (%d days)", test[0].date(), test[-1].date(), len(test))
         jobs, thresholds = grid_jobs(list(prepared.values()), test, args.models, args.horizons, args.windows,
                                      args.classes)
-        results = run_jobs(jobs, args.n_jobs, model_kwargs, cache_dir, "grid")
+        results = run_jobs(jobs, args.n_jobs, fit_kwargs, cache_dir, "grid", args.gpu_jobs)
         metrics = grid_metrics(jobs, results, test)
         preds = grid_predictions(jobs, results, test)
         pattern = window_pattern(metrics)
@@ -192,7 +214,7 @@ def run(args: argparse.Namespace) -> dict:
         jobs = [j for n, p in prepared.items()
                 for j in walk_forward_jobs(p, args.models, args.horizons, args.classes, firsts[n], args.windows,
                                            args.wf_train_years)]
-        results = run_jobs(jobs, args.n_jobs, model_kwargs, cache_dir, "walk-forward")
+        results = run_jobs(jobs, args.n_jobs, fit_kwargs, cache_dir, "walk-forward", args.gpu_jobs)
         wf = walk_forward_predictions(jobs, results, prepared)
         wf.to_csv(os.path.join(args.out_dir, "wf_predictions.csv.gz"), index=False)
         common = pd.Timestamp(f"{max(firsts.values())}-01-01")

@@ -21,13 +21,15 @@ from matplotlib.ticker import FuncFormatter  # noqa: E402
 from .experiment import matched_window  # noqa: E402
 
 SURFACE, INK, INK2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e4e3df"
-SERIES = ("#2a78d6", "#eb6834", "#1baf7a", "#eda100")
+SERIES = ("#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#8a5cd6", "#d6457f", "#1a9cb0", "#8c6a2b")
 DIVERGING = LinearSegmentedColormap.from_list(
     "vs_buy_hold", ["#a8302f", "#e34948", "#f3b3b2", "#f0efec", "#9ec5f4", "#2a78d6", "#184f95"])
 
 METRIC_LABEL = {"accuracy": ("Accuracy (%)", 100, "{:.1f}"), "win_rate": ("Winning rate (%)", 100, "{:.1f}"),
                 "ret_per_trade": ("Return per trade (%)", 100, "{:.2f}"), "sharpe": ("Sharpe ratio", 1, "{:.2f}")}
-MODEL_LABEL = {"svm": "SVM", "ann": "ANN", "knn": "kNN"}
+MODEL_LABEL = {"svm": "SVM", "ann": "ANN", "knn": "kNN", "rf": "Random forest", "xgb": "XGBoost",
+               "lgbm": "LightGBM", "logit": "Logit", "arima": "ARIMA"}
+HEATMAP_COLS = 4  # 모델이 더 많으면 다음 줄로
 
 
 def _style(ax):
@@ -48,11 +50,17 @@ def grid_heatmaps(metrics: pd.DataFrame, scenario: str, n_classes: int, metric: 
     tables = {m: t for m, t in tables.items() if not t.empty}
     if not tables:
         return
-    lim = max(float(np.nanmax(np.abs(t.sub(bh, axis=0).to_numpy()))) for t in tables.values()) * scale or 1.0
+    diffs = np.concatenate([np.abs(t.sub(bh, axis=0).to_numpy()).ravel() for t in tables.values()])
+    diffs = diffs[np.isfinite(diffs)]  # 거래가 없는 칸(승률 · Sharpe 없음)은 빼고 색 범위를 잡는다
+    lim = (float(diffs.max()) * scale if len(diffs) else 0.0) or 1.0
 
-    fig, axes = plt.subplots(1, len(tables), figsize=(4.9 * len(tables) + 0.8, 4.8), squeeze=False,
+    ncols = min(len(tables), HEATMAP_COLS)
+    nrows = -(-len(tables) // ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4.9 * ncols + 0.8, 4.8 * nrows), squeeze=False,
                              facecolor=SURFACE, constrained_layout=True)
-    for ax, (m, t) in zip(axes[0], tables.items()):
+    for ax in axes.ravel()[len(tables):]:
+        ax.set_visible(False)
+    for ax, (m, t) in zip(axes.ravel(), tables.items()):
         diff = t.sub(bh, axis=0).to_numpy() * scale
         im = ax.imshow(diff, cmap=DIVERGING, vmin=-lim, vmax=lim, aspect="auto")
         for i, s in enumerate(t.index):
@@ -69,7 +77,7 @@ def grid_heatmaps(metrics: pd.DataFrame, scenario: str, n_classes: int, metric: 
         ax.set_ylabel("Forecast horizon s (days)", color=INK2, fontsize=9)
         ax.set_title(MODEL_LABEL.get(m, m), color=INK, fontsize=11, loc="left")
         _style(ax)
-    cbar = fig.colorbar(im, ax=axes[0].tolist(), shrink=0.85, pad=0.01)
+    cbar = fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.85, pad=0.01)
     cbar.set_label(f"{label}: strategy minus buy & hold", color=INK2, fontsize=9)
     cbar.ax.tick_params(colors=INK2, labelsize=8)
     fig.suptitle(f"{label} — {scenario}, {n_classes}-class (outlined: n ≈ s)", color=INK, fontsize=12, x=0.01,
