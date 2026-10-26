@@ -13,12 +13,17 @@ pip install -r requirements.txt
 python run_ti_forecast.py data/kosdaq150.xlsx                       # 그리드(논문 Table III–X) + walk-forward
 python run_ti_forecast.py data/kosdaq150.xlsx --models svm --skip-wf  # 그리드만, SVM만
 python run_ti_forecast.py data/kosdaq150.xlsx --scenarios close_long --skip-grid --cost-bps 5
+python run_ti_forecast.py data/kosdaq150.xlsx --models rf,xgb,lgbm,logit,arima  # 트리 계열 · 계량 모형
+python run_ti_forecast.py data/kosdaq150.xlsx --models all --ann-backend torch --device cuda --svm-backend cuml  # GPU
 pytest tests                                                         # 지표 식 · 미래 정보 미사용 · 분할 규칙
 ```
+
+`--models` 기본값은 논문의 `svm,ann,knn`입니다. 트리 계열 · 계량 모형은 선택 패키지가 필요합니다(`pip install xgboost lightgbm statsmodels`, ANN torch 백엔드는 `torch`, GPU SVM은 RAPIDS `cuml`). 없는 패키지를 쓰는 모델을 고르면 시작할 때 설치 명령을 알려 줍니다.
 
 입력은 DataGuide 엑셀(메타데이터 줄 뒤 `D A T E | 저가지수 | 고가지수 | 시가지수 | 종가지수`)이나 `date, open, high, low, close` csv입니다. 시가·고가·저가가 없는 날은 비워 두면 됩니다.
 
 전체 실행(3 시나리오 × 9 예측기간 × 8 윈도우 × 2/3 클래스 × 3 모델 = 1,296개 학습 + 연도별 walk-forward)은 4코어에서 2~3시간 걸립니다. 대부분 SVM 격자 탐색(110개 조합 × 5 fold)이며, 끝난 학습은 `out/.../cache/`에 저장되어 다시 실행하면 재사용합니다.
+추가 모델은 모델마다 그리드 432개(ARIMA는 윈도우와 무관해 54개) + walk-forward 약 540개 작업이라, 아래 [속도 · GPU](#속도--gpu) 표의 1회 학습 시간 × 작업 수 ÷ 코어 수로 어림할 수 있습니다.
 
 ## 기술지표 (모두 같은 입력 윈도우 n)
 
@@ -56,10 +61,50 @@ pytest tests                                                         # 지표 �
 - ANN: 입력 10 – 은닉 10(tanh) – softmax, 학습구간 뒤 25%로 early stopping, `--ann-seeds`(5)개 시드의 확률 평균
 - kNN: k ∈ {1, …, 10}을 5-fold 교차검증 정확도로 선택
 
+**추가 모델 (논문에는 없음, 비교용)** — 트리 계열과 로지스틱 회귀는 같은 10개 지표 · 같은 표준화 · 같은 purged k-fold로 하이퍼파라미터를 고르므로 논문 모델과 바로 비교됩니다.
+
+| `--models` | 모델 | 입력 | 하이퍼파라미터 (purged 5-fold 정확도로 선택) |
+|---|---|---|---|
+| `rf` | 랜덤 포레스트 200그루 (sklearn) | 지표 10개 | max_depth ∈ {3, 6, 제한 없음} × min_samples_leaf ∈ {5, 20, 80} |
+| `xgb` | XGBoost (hist) | 지표 10개 | max_depth ∈ {2, 3, 5} × 학습률 ∈ {0.03, 0.1} × 나무 수 ∈ {50, 100, 200, 400} |
+| `lgbm` | LightGBM | 지표 10개 | `xgb`와 같은 격자 (num_leaves = 2^max_depth) |
+| `logit` | 로지스틱 회귀 (L2, 3 클래스는 다항 로짓) | 지표 10개 | C ∈ {10⁻³, …, 10²} |
+| `arima` | 로그가격 ARIMA(p, 1, q) + 상수 | 일간 로그수익률 | (p, q) ∈ {0, 1, 2}²를 AIC로 선택 |
+
+- 부스팅의 나무 수는 fold마다 400그루를 한 번 학습한 뒤 앞쪽 50 · 100 · 200그루로도 예측해 고르므로, 나무 수 후보를 늘려도 학습 횟수는 같습니다.
+- `arima`는 지표를 쓰지 않습니다. 같은 학습 기간의 일간 로그수익률(평가 시작 전날까지)로 계수를 한 번 추정하고, 평가일마다 그날까지의 수익률로 s일 누적수익률을 예측해 레이블 규칙(2 클래스: > 0, 3 클래스: ±δ 밖)으로 방향을 정합니다. 입력 윈도우 n과 무관하므로 그리드에서는 한 번만 계산해 모든 n 칸에 같은 값을 넣습니다(히트맵에서 가로로 같은 색). 일간 수익률의 자기상관이 작으면 s일 예측이 거의 평균 수익률 × s라, 2 클래스는 대부분 평균의 부호 쪽(평균이 양수면 Up), 3 클래스는 대부분 No Move가 됩니다. 거래가 없는 칸은 승률 · Sharpe가 비어 있습니다.
+
 **성과**
 - 논문 지표: 매 평가일 Up → s일 매수, Down → s일 매도, No Move → 거래 없음. 정확도, 승률, 거래당 수익률, Sharpe = √(252/s) · 평균 / 표준편차(무위험금리 0). 겹치는 s일 거래를 독립으로 세므로 낙관적입니다. `acc_se`는 겹침을 감안한 정확도 표준오차 근사 √(p(1−p)/(N/s))입니다.
 - tranche 포트폴리오: 매일 신호의 1/s를 s일 보유하는 겹치는 포지션으로 일간 수익률을 만들고, 신호 다음 날 종가에 체결(`--delay 1`)하며, 비중 변화 1당 10bp(`--cost-bps`)를 뺍니다. 롱숏(논문)과 롱온리(Up일 때만 매수) 두 가지로 CAGR · Sharpe · MDD를 계산합니다.
 - 비교 기준은 같은 기간 Buy & Hold입니다.
+
+## 속도 · GPU
+
+학습 한 번에 걸리는 시간(1코어, 학습 3,109일 · 평가 871일 · 3 클래스, 합성 데이터)입니다. 작업끼리는 `--n-jobs`개 프로세스로 병렬 실행됩니다.
+
+| 모델 | 1회 학습 | 비고 |
+|---|---|---|
+| `svm` | 약 106초 | 110개 조합 × 5 fold. 전체 실행 시간의 대부분 |
+| `rf` | 약 32초 | |
+| `xgb` | 약 23초 | 3 클래스는 라운드마다 나무 3그루 |
+| `lgbm` | 약 14초 | |
+| `ann` | 약 2.5초 (torch 약 1.2초) | |
+| `arima` | 약 2초 | 같은 학습 표본은 프로세스 안에서 다시 맞추지 않음 |
+| `knn`, `logit` | 1초 안팎 | |
+
+가속 옵션:
+
+| 옵션 | 효과 |
+|---|---|
+| `--ann-backend torch` | 시드 5개를 가중치 텐서 하나로 묶어 한 번에 학습합니다. CPU에서도 2배쯤 빠르고, `--device cuda`면 GPU에서 돌립니다. 구조 · 학습 규칙(Adam, minibatch 200, L2 10⁻⁴, 같은 early stopping)은 같지만 초기값 난수와 2 클래스 출력층(softmax 2개 vs logistic 1개)이 달라 결과 숫자가 sklearn과 조금 다릅니다. |
+| `--device cuda` | `xgb`를 GPU에서 학습합니다(`device="cuda"`). |
+| `--svm-backend cuml` | RAPIDS cuML의 GPU SVC로 같은 γ × C 격자를 탐색합니다. sklearn 경로는 커널 행렬을 미리 계산해 재사용하고, cuML 경로는 SVC가 커널을 직접 계산합니다(같은 격자 · 같은 fold. 테스트에서 sklearn으로 두 경로가 같은 답을 내는지 확인). |
+| `--gpu-jobs` | GPU 작업을 동시에 돌릴 프로세스 수(기본 1). GPU 작업을 먼저 이만큼 병렬로 돌리고, 나머지 CPU 작업을 `--n-jobs`개로 돌립니다. |
+
+- GPU를 쓰는 옵션을 골랐는데 CUDA GPU가 보이지 않으면 바로 멈춥니다(XGBoost는 GPU가 없으면 경고 없이 CPU로 돌기 때문입니다).
+- 표본이 작아서(최대 약 3,100일 × 지표 10개) GPU는 큰 데이터에서만큼 빨라지지 않습니다. 커널 실행 · 데이터 복사 고정비가 학습 시간과 비슷하기 때문입니다. 가장 확실한 가속은 코어 수(`--n-jobs`)와 캐시입니다. GPU 경로(`--device cuda`, `--svm-backend cuml`)는 GPU가 없는 환경에서 만들어 GPU에서는 아직 실행해 보지 않았습니다.
+- 캐시: backend · device가 기본값(sklearn · cpu)이 아니면 캐시 파일 이름에 붙습니다(`..._torch.pkl`, `..._cuda.pkl`). 기본 설정의 캐시 이름은 예전과 같아서, 이미 돌려 둔 SVM · ANN · kNN 결과를 그대로 다시 씁니다.
 
 ## 논문과 다르게 한 것
 
@@ -69,6 +114,8 @@ pytest tests                                                         # 지표 �
 - **표본**: 종목 50개의 평균 ± 표준편차가 아니라 지수 하나라 칸마다 값이 하나이고 잡음이 큽니다(`acc_se` 참고).
 
 ## 결과 (코스닥150, `results/kosdaq150/`)
+
+아래는 논문 모델(SVM · ANN · kNN) 결과입니다. 추가 모델(트리 계열 · 계량 모형)은 아직 코스닥150 데이터로 돌리지 않았습니다.
 
 기본 설정(진입 1일 지연, 거래비용 10bp, 무위험금리 0)으로 돌린 결과입니다. 전체 표와 그림은 `results/kosdaq150/`에 있습니다(일별 예측 중 그리드 쪽은 15MB라 빼고, walk-forward 예측만 넣었습니다).
 
@@ -111,7 +158,7 @@ run_ti_forecast.py      진입점 (CLI)
 ti_forecast/
   data.py               DataGuide 엑셀 / csv → 시가·고가·저가·종가
   indicators.py         10개 기술지표 (OHLC 원식 · 종가 전용)
-  models.py             SVM · ANN · kNN, purged k-fold 하이퍼파라미터 선택
+  models.py             SVM · ANN · kNN + RF · XGBoost · LightGBM · 로짓 · ARIMA, purged k-fold 하이퍼파라미터 선택
   experiment.py         레이블 · 분할 · 논문 지표 · tranche 백테스트 · 그리드 · walk-forward
   plotting.py           히트맵 · 누적수익률
 tests/                  지표 식 · 미래 정보 미사용 · 분할 · 백테스트 · 전체 실행

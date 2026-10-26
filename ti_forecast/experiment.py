@@ -11,6 +11,9 @@
 walk-forward: 매년 첫 거래일에 그 전까지 레이블이 확정된 표본으로 다시 학습해 그 해를 예측한다. 입력 윈도우는 논문의
 결론대로 n = s (s < 3 이면 3).
 
+ARIMA 는 지표 대신 같은 학습 기간의 일간 로그수익률(평가 시작 전날까지 — 그날까지 다 알려진 값)에 맞추고, 평가일마다 그날까지의
+수익률로 예측한다. 입력 윈도우 n 을 쓰지 않으므로 그리드에서는 윈도우마다 같은 결과를 한 번만 계산해 나눠 쓴다.
+
 논문 성과지표 (Sec. 6): 매 평가일에 'Up' → s일 매수, 'Down' → s일 매도, 'No Move' → 거래 없음.
     정확도, 승률(수익 거래 비율), 거래당 수익률, Sharpe = sqrt(252/s) · 평균 / 표준편차 (무위험금리 0).
 겹치는 s일 거래를 독립으로 세므로 낙관적이다. 그래서 매일 신호의 1/s 를 s일 보유하는 tranche 포트폴리오로
@@ -25,7 +28,7 @@ import logging
 import os
 import pickle
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -34,7 +37,7 @@ from joblib import Parallel, delayed
 
 from .data import ohlc_start
 from .indicators import compute_indicators
-from .models import fit_predict
+from .models import PRICE_MODELS, fit_predict, uses_gpu
 
 logger = logging.getLogger(__name__)
 
@@ -212,6 +215,20 @@ def training_rows(p: Prepared, s: int, cutoff: pd.Timestamp, first: Optional[pd.
     return p.dates[keep]
 
 
+def price_inputs(p: Prepared, first: pd.Timestamp, cutoff: pd.Timestamp,
+                 te_dates: pd.DatetimeIndex) -> Tuple[np.ndarray, np.ndarray, Dict]:
+    """ARIMA 입력: 학습 = ``first`` ≤ 날짜 < ``cutoff`` 의 일간 로그수익률, 평가 경로 = ``cutoff`` ~ 마지막 평가일의
+    모든 거래일 로그수익률과 그중 평가일 위치."""
+    lr = np.log(p.close).diff()
+    idx = lr.index
+    fit = lr[(idx >= first) & (idx < cutoff)].dropna().to_numpy()
+    path = lr[(idx >= cutoff) & (idx <= te_dates[-1])]
+    pos = path.index.get_indexer(te_dates)
+    if (pos < 0).any():
+        raise ValueError(f"{p.scenario.name}: 평가일 일부가 가격 표본에 없습니다")
+    return fit[:, None], path.to_numpy()[:, None], {"positions": pos}
+
+
 def matched_window(s: int, windows: Sequence[int] = WINDOWS) -> int:
     """논문 결론의 n ≈ s: 후보 중 s 에 가장 가까운 윈도우 (동점이면 작은 쪽)."""
     return min(windows, key=lambda n: (abs(n - s), n))
@@ -230,15 +247,23 @@ class Job:
     X_te: np.ndarray
     gap: int
     meta: Dict
+    fit_kwargs: Dict = field(default_factory=dict)  # 작업마다 다른 모델 인자 (ARIMA 의 예측기간 · δ 등)
+
+
+def cache_suffix(kwargs: Dict) -> str:
+    """기본값이 아닌 backend · device 를 캐시 파일 이름에 붙인다 (기본 설정의 캐시 이름은 예전과 같다)."""
+    parts = [str(kwargs[k]) for k in ("backend", "device") if kwargs.get(k) not in (None, "sklearn", "cpu")]
+    return "_" + "-".join(parts) if parts else ""
 
 
 def _run_job(job: Job, model_kwargs: Dict, cache_dir: Optional[str]):
-    path = os.path.join(cache_dir, job.key + ".pkl") if cache_dir else None
+    kwargs = model_kwargs.get(job.model, {})
+    path = os.path.join(cache_dir, job.key + cache_suffix(kwargs) + ".pkl") if cache_dir else None
     if path and os.path.exists(path):
         with open(path, "rb") as f:
             return job.key, pickle.load(f)
     t0 = time.time()
-    pred, info = fit_predict(job.model, job.X_tr, job.y_tr, job.X_te, job.gap, **model_kwargs.get(job.model, {}))
+    pred, info = fit_predict(job.model, job.X_tr, job.y_tr, job.X_te, job.gap, **kwargs, **job.fit_kwargs)
     result = (pred, {**{k: float(v) for k, v in info.items()}, "seconds": time.time() - t0, "n_train": len(job.y_tr)})
     if path:
         tmp = path + ".tmp"
@@ -249,19 +274,30 @@ def _run_job(job: Job, model_kwargs: Dict, cache_dir: Optional[str]):
 
 
 def run_jobs(jobs: List[Job], n_jobs: int = 1, model_kwargs: Optional[Dict] = None,
-             cache_dir: Optional[str] = None, label: str = "jobs") -> Dict[str, Tuple[np.ndarray, Dict]]:
-    """SVM 처럼 오래 걸리는 작업부터 병렬로 돌린다. ``cache_dir`` 가 있으면 끝난 작업을 저장·재사용한다."""
+             cache_dir: Optional[str] = None, label: str = "jobs", gpu_jobs: int = 1) -> Dict[str, Tuple[np.ndarray, Dict]]:
+    """SVM 처럼 오래 걸리는 작업부터 병렬로 돌린다. ``cache_dir`` 가 있으면 끝난 작업을 저장·재사용한다.
+
+    key 가 같은 작업(입력 윈도우를 쓰지 않는 ARIMA)은 한 번만 돌린다. GPU 를 쓰는 작업(device = cuda, cuML)은 GPU
+    하나를 여러 프로세스가 나눠 쓰지 않도록 따로 ``gpu_jobs`` 개 프로세스로 먼저 돌리고, 나머지를 ``n_jobs`` 개로 돌린다.
+    """
     if cache_dir:
         os.makedirs(cache_dir, exist_ok=True)
-    order = {"svm": 0, "ann": 1, "knn": 2}
-    jobs = sorted(jobs, key=lambda j: (order.get(j.model, 3), -len(j.y_tr)))
-    out, t0 = {}, time.time()
-    results = Parallel(n_jobs=n_jobs, return_as="generator_unordered")(
-        delayed(_run_job)(job, model_kwargs or {}, cache_dir) for job in jobs)
-    for i, (key, res) in enumerate(results, 1):
-        out[key] = res
-        if i % max(1, len(jobs) // 20) == 0 or i == len(jobs):
-            logger.info("%s: %d/%d done (%.0fs)", label, i, len(jobs), time.time() - t0)
+    model_kwargs = model_kwargs or {}
+    order = {"svm": 0, "ann": 1, "rf": 2, "xgb": 3, "lgbm": 4, "arima": 5, "knn": 6, "logit": 7}
+    unique = sorted({j.key: j for j in jobs}.values(), key=lambda j: (order.get(j.model, 8), -len(j.y_tr)))
+    gpu = [j for j in unique if uses_gpu(model_kwargs.get(j.model, {}))]
+    cpu = [j for j in unique if not uses_gpu(model_kwargs.get(j.model, {}))]
+    out, t0, done = {}, time.time(), 0
+    for group, workers in ((gpu, gpu_jobs), (cpu, n_jobs)):
+        if not group:
+            continue
+        results = Parallel(n_jobs=workers, return_as="generator_unordered")(
+            delayed(_run_job)(job, model_kwargs, cache_dir) for job in group)
+        for key, res in results:
+            out[key] = res
+            done += 1
+            if done % max(1, len(unique) // 20) == 0 or done == len(unique):
+                logger.info("%s: %d/%d done (%.0fs)", label, done, len(unique), time.time() - t0)
     return out
 
 
@@ -295,14 +331,20 @@ def grid_jobs(prepared: Sequence[Prepared], test: pd.DatetimeIndex, models: Sequ
             delta = no_move_threshold(r_tr)
             thresholds[(name, s)] = {"delta": delta, "train_start": tr_dates[0], "train_end": tr_dates[-1],
                                      "n_train": len(tr_dates)}
+            if any(m in PRICE_MODELS for m in models):
+                px_tr, px_te, px_kw = price_inputs(p, tr_dates[0], test[0], test)
             for n in windows:
                 X_tr, X_te = _standardize(p.features[n].loc[tr_dates].to_numpy(), p.features[n].loc[test].to_numpy())
                 for k in class_counts:
                     y_tr = make_labels(r_tr, k, delta)
                     for m in models:
-                        jobs.append(Job(f"grid_{name}_{m}_c{k}_s{s}_n{n}", m, X_tr, y_tr, X_te, s - 1,
-                                        {"scenario": name, "model": m, "n_classes": k, "horizon": s, "window": n,
-                                         "delta": delta, "y_te": make_labels(r_te, k, delta), "r_te": r_te}))
+                        meta = {"scenario": name, "model": m, "n_classes": k, "horizon": s, "window": n,
+                                "delta": delta, "y_te": make_labels(r_te, k, delta), "r_te": r_te}
+                        if m in PRICE_MODELS:  # 윈도우를 쓰지 않으므로 key 에 n 이 없다 → 한 번만 계산
+                            jobs.append(Job(f"grid_{name}_{m}_c{k}_s{s}", m, px_tr, y_tr, px_te, s - 1, meta,
+                                            {**px_kw, "horizon": s, "delta": delta, "n_classes": k}))
+                        else:
+                            jobs.append(Job(f"grid_{name}_{m}_c{k}_s{s}_n{n}", m, X_tr, y_tr, X_te, s - 1, meta))
     return jobs, thresholds
 
 
@@ -351,7 +393,10 @@ def window_pattern(metrics: pd.DataFrame, columns=("accuracy", "win_rate", "ret_
     m = metrics[metrics["model"] != "buy_hold"]
     for key, g in m.groupby(["scenario", "model", "n_classes"]):
         for col in columns:
-            table = g.pivot(index="horizon", columns="window", values=col)
+            # 거래가 하나도 없는 예측기간(예: ARIMA 3 클래스가 전부 No Move)은 승률 · Sharpe 가 없다
+            table = g.pivot(index="horizon", columns="window", values=col).dropna(how="all")
+            if table.empty:
+                continue
             best = table.idxmax(axis=1)
             matched = [matched_window(s, list(table.columns)) for s in table.index]
             ranks = table.rank(axis=1, ascending=False)
@@ -413,13 +458,19 @@ def walk_forward_jobs(p: Prepared, models: Sequence[str], horizons: Sequence[int
             r_tr = p.fwd.loc[tr_dates, s].to_numpy()
             delta = no_move_threshold(r_tr)
             X_tr, X_te = _standardize(p.features[n].loc[tr_dates].to_numpy(), p.features[n].loc[te_dates].to_numpy())
+            if any(m in PRICE_MODELS for m in models):
+                px_tr, px_te, px_kw = price_inputs(p, tr_dates[0], start, te_dates)
             for k in class_counts:
                 y_tr = make_labels(r_tr, k, delta)
                 for m in models:
                     key = f"wf_{p.scenario.name}_{m}_c{k}_s{s}_n{n}_{start.year}"
-                    jobs.append(Job(key, m, X_tr, y_tr, X_te, s - 1,
-                                    {"scenario": p.scenario.name, "model": m, "n_classes": k, "horizon": s,
-                                     "window": n, "delta": delta, "dates": te_dates, "refit": start}))
+                    meta = {"scenario": p.scenario.name, "model": m, "n_classes": k, "horizon": s,
+                            "window": n, "delta": delta, "dates": te_dates, "refit": start}
+                    if m in PRICE_MODELS:
+                        jobs.append(Job(key, m, px_tr, y_tr, px_te, s - 1, meta,
+                                        {**px_kw, "horizon": s, "delta": delta, "n_classes": k}))
+                    else:
+                        jobs.append(Job(key, m, X_tr, y_tr, X_te, s - 1, meta))
     return jobs
 
 
