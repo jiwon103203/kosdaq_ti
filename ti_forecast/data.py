@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import os
 import re
-from typing import Iterable, Optional, Sequence
+from typing import Iterable, Optional, Sequence, Tuple
 
 import pandas as pd
 
@@ -168,3 +168,50 @@ def ohlc_start(df: pd.DataFrame) -> Optional[pd.Timestamp]:
         missing = full.loc[start:][~full.loc[start:]].index
         raise ValueError(f"OHLC 가 {start.date()} 이후 {len(missing)}일 비어 있습니다 (첫 날짜 {missing[0].date()})")
     return start
+
+
+# ---------------------------------------------------------------------------
+# 주기 (일간 · 주간)
+# ---------------------------------------------------------------------------
+
+FREQS = ("D", "W")
+
+
+def infer_freq(index: pd.DatetimeIndex) -> str:
+    """날짜 간격의 중앙값이 4일 이상이면 주간('W'), 아니면 일간('D')."""
+    if len(index) < 3:
+        return "D"
+    gap = float(pd.Series(index).diff().dt.days.median())
+    return "W" if gap >= 4 else "D"
+
+
+def to_weekly(df: pd.DataFrame) -> pd.DataFrame:
+    """일간 시가·고가·저가·종가 → 주간 (월~금 한 주, 날짜 = 그 주 마지막 거래일).
+
+    시가 = 첫 거래일 시가, 고가 = 최고, 저가 = 최저, 종가 = 마지막 거래일 종가. 주중 하루라도 시가·고가·저가가 없으면
+    그 주의 시가·고가·저가는 비운다(종가 전용 구간과 OHLC 구간이 섞인 주를 OHLC 로 쓰지 않도록).
+    """
+    week = df.index.to_period("W-FRI")
+    g = df.groupby(week)
+    full = df[["open", "high", "low"]].notna().all(axis=1).groupby(week).all()
+    out = pd.DataFrame({"open": g["open"].first(), "high": g["high"].max(), "low": g["low"].min(),
+                        "close": g["close"].last()})
+    out.loc[~full, ["open", "high", "low"]] = float("nan")
+    out.index = pd.DatetimeIndex(pd.Series(df.index, index=df.index).groupby(week).last().to_numpy(), name="date")
+    return out
+
+
+def apply_freq(df: pd.DataFrame, freq: str = "auto") -> Tuple[pd.DataFrame, str]:
+    """``freq`` 에 맞춘 가격과 주기. auto = 입력 그대로(간격으로 판별), W = 일간 입력이면 주간으로 바꾼다."""
+    given = infer_freq(df.index)
+    if freq == "auto":
+        return df, given
+    if freq not in FREQS:
+        raise ValueError(f"freq must be one of auto, {FREQS}, got {freq!r}")
+    if freq == "D" and given == "W":
+        raise ValueError("입력이 주간 데이터입니다 (날짜 간격 중앙값 ≥ 4일). --freq W 또는 auto 를 쓰세요")
+    if freq == "W" and given == "D":
+        weekly = to_weekly(df)
+        logger.info("daily → weekly: %d days → %d weeks", len(df), len(weekly))
+        return weekly, "W"
+    return df, freq

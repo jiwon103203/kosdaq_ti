@@ -13,12 +13,15 @@ import pytest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
+import run_learning_curve  # noqa: E402
 import run_ti_forecast  # noqa: E402
-from ti_forecast.data import load_ohlc, ohlc_start  # noqa: E402
+from ti_forecast.data import apply_freq, infer_freq, load_ohlc, ohlc_start, to_weekly  # noqa: E402
 from ti_forecast.experiment import (Job, Scenario, build_scenarios, cache_suffix, common_test_dates,  # noqa: E402
                                     grid_jobs, make_labels, matched_window, no_move_threshold, paper_metrics,
-                                    prepare, price_inputs, refit_dates, run_jobs, training_rows, tranche_backtest,
-                                    walk_forward_jobs)
+                                    performance_metrics, prepare, price_inputs, refit_dates, run_jobs, training_rows,
+                                    tranche_backtest, walk_forward_jobs)
+from ti_forecast.learning_curve import (default_first_year, learning_curve_jobs, min_detectable_edge,  # noqa: E402
+                                        required_samples)
 from ti_forecast.indicators import NAMES, compute_indicators  # noqa: E402
 from ti_forecast.models import (_svm_direct, arma_cum_forecast, check_dependencies, fit_predict,  # noqa: E402
                                 fit_predict_svm, purged_kfold, select_arma)
@@ -372,3 +375,120 @@ def test_cli_end_to_end(tmp_path):
     assert run_ti_forecast.main([str(path), "--out", str(out), "--models", "knn", "--horizons", "1,5",
                                  "--windows", "3,5", "--warmup", "40", "--wf-min-train-years", "1",
                                  "--n-jobs", "1", "-q", "--skip-wf"]) == 0
+
+
+# ---------------------------------------------------------------------------
+# 주기 (주간)
+# ---------------------------------------------------------------------------
+
+def test_to_weekly_aggregates_ohlc_by_week():
+    df = simulate_ohlc(n=60, ohlc_from=7, start="2024-01-01")  # 1월 1일(월) ~, 앞 7일은 종가만
+    df = df.drop(pd.Timestamp("2024-01-19"))                     # 금요일이 빠진 주 → 그 주 마지막 거래일은 목요일
+    w = to_weekly(df)
+    assert w.index[0] == pd.Timestamp("2024-01-05") and pd.Timestamp("2024-01-18") in w.index
+    week = df.loc["2024-01-15":"2024-01-18"]
+    row = w.loc["2024-01-18"]
+    assert row["open"] == week["open"].iloc[0] and row["close"] == week["close"].iloc[-1]
+    assert row["high"] == week["high"].max() and row["low"] == week["low"].min()
+    # 둘째 주는 월·화만 종가 전용 → 그 주 시가·고가·저가는 비우고, OHLC 는 셋째 주부터
+    assert w.loc["2024-01-12", ["open", "high", "low"]].isna().all()
+    assert ohlc_start(w) == pd.Timestamp("2024-01-18")
+    assert infer_freq(df.index) == "D" and infer_freq(w.index) == "W"
+
+
+def test_apply_freq_converts_daily_and_rejects_weekly_as_daily():
+    df = simulate_ohlc(n=200, ohlc_from=0)
+    w, freq = apply_freq(df, "W")
+    assert freq == "W" and len(w) == len(to_weekly(df))
+    assert apply_freq(w, "auto")[1] == "W" and apply_freq(df, "auto")[1] == "D"
+    assert apply_freq(w, "W")[0] is w
+    with pytest.raises(ValueError, match="--freq W"):
+        apply_freq(w, "D")
+
+
+def test_performance_metrics_annualize_by_frequency():
+    rng = np.random.default_rng(0)
+    idx = pd.date_range("2015-01-02", periods=520, freq="W-FRI")
+    ret = pd.Series(rng.normal(0.002, 0.03, len(idx)), index=idx)
+    m = performance_metrics(ret, periods=52)
+    assert m["ann_vol"] == pytest.approx(ret.std() * np.sqrt(52))
+    assert m["cagr"] == pytest.approx((1 + ret).prod() ** (1 / 10) - 1)  # 520주 = 10년
+    pm = paper_metrics(np.ones(len(ret), dtype=int), np.ones(len(ret), dtype=int), ret.to_numpy(), 1, periods=52)
+    assert pm["sharpe"] == pytest.approx(np.sqrt(52) * ret.mean() / ret.std())
+
+
+def test_cli_weekly_end_to_end(tmp_path):
+    df = simulate_ohlc(n=2600, ohlc_from=600, start="2010-01-04")
+    path = tmp_path / "px.csv"
+    df.reset_index().to_csv(path, index=False)
+    out = tmp_path / "out"
+    rc = run_ti_forecast.main([str(path), "--out", str(out), "--freq", "W", "--models", "knn", "--horizons", "1,4",
+                               "--windows", "3,4", "--warmup", "20", "--wf-min-train-years", "2", "--n-jobs", "1",
+                               "-q"])
+    assert rc == 0
+    assert "n_weeks" in (out / "summary.md").read_text(encoding="utf-8")
+    blend = pd.read_csv(out / "wf_horizon_blend.csv")
+    bh = blend[blend["strategy"] == "buy_hold"].iloc[0]
+    weekly = to_weekly(df)["close"].pct_change()
+    assert bh["ann_vol"] == pytest.approx(weekly.loc[bh["start"]:bh["end"]].std() * np.sqrt(52), rel=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# 학습 곡선
+# ---------------------------------------------------------------------------
+
+def test_rolling_training_rows_start_at_window():
+    df = simulate_ohlc(n=1300, ohlc_from=0)
+    p = prepare(df, Scenario("close_long", True, df.index[0]), (3,), (5,), warmup=40)
+    cutoff = p.dates[1000]
+    first = cutoff - pd.DateOffset(years=2)
+    rows = training_rows(p, 5, cutoff, first)
+    assert rows[0] >= first and rows[0] == p.dates[p.dates >= first][0]
+    assert len(rows) < len(training_rows(p, 5, cutoff))
+
+
+def test_knn_handles_tiny_training_sample():
+    from ti_forecast.models import fit_predict_knn
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(52, 3))
+    y = np.where(X[:, 0] > 0, 1, -1)
+    pred, info = fit_predict_knn(X, y, X[:5], gap=12)
+    assert len(pred) == 5 and 1 <= info["k"] <= 10
+
+
+def test_sample_size_formula_round_trips():
+    n = required_samples(0.03)
+    assert n == pytest.approx((1.959964 + 0.841621) ** 2 * 0.25 / 0.03 ** 2)
+    assert min_detectable_edge(n) == pytest.approx(0.03)
+
+
+def test_learning_curve_jobs_share_evaluation_dates():
+    df = simulate_ohlc(n=1800, ohlc_from=0, start="2010-01-04")
+    p = prepare(df, Scenario("close_long", True, df.index[0]), (3, 5), (1, 5), warmup=40)
+    first = default_first_year(p.dates, 3)
+    assert refit_dates(p.dates, first)[0] - pd.DateOffset(years=3) >= p.dates[0]
+    jobs = learning_curve_jobs(p, ("knn",), (1, 5), (2,), first, (3, 5), (1, 3))
+    assert len({j.key for j in jobs}) == len(jobs)
+    by_ty = {ty: [j for j in jobs if j.meta["train_years"] == ty] for ty in (1, 3)}
+    for a, b in zip(by_ty[1], by_ty[3]):
+        assert a.meta["dates"].equals(b.meta["dates"]) and len(a.y_tr) < len(b.y_tr)
+
+
+def test_learning_curve_cli(tmp_path):
+    df = simulate_ohlc(n=1800, ohlc_from=0, start="2010-01-04")
+    path = tmp_path / "px.csv"
+    df.reset_index().to_csv(path, index=False)
+    out = tmp_path / "lc"
+    args = [str(path), "--out", str(out), "--models", "knn,logit", "--horizons", "1,5", "--windows", "3,5",
+            "--warmup", "40", "--train-years", "1,3", "--n-jobs", "1", "-q"]
+    assert run_learning_curve.main(args) == 0
+    for name in ("summary.md", "lc_metrics.csv", "lc_summary.csv", "lc_sample_size.csv", "learning_curve_c2.png",
+                 "learning_curve_c3.png"):
+        assert (out / name).exists(), name
+    m = pd.read_csv(out / "lc_metrics.csv")
+    assert set(m["train_years"]) == {1, 3} and set(m["model"]) == {"knn", "logit"}
+    # 학습 기간이 달라도 평가일 · Buy & Hold 는 같다 (3 클래스는 δ 가 학습구간에서 정해져 레이블이 조금 다르다)
+    assert m[m["n_classes"] == 2].groupby("horizon")["bh_accuracy"].nunique().max() == 1
+    assert m.groupby(["n_classes", "horizon"])["n_eval"].nunique().max() == 1
+    assert (m.groupby(["model", "n_classes", "horizon"])["n_train"].diff().dropna() > 0).all()
+    assert run_learning_curve.main(args[:-5] + ["--train-years", "30", "-q"]) == 1  # 표본보다 긴 학습 기간

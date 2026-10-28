@@ -42,7 +42,7 @@ def _style(ax):
 
 
 def grid_heatmaps(metrics: pd.DataFrame, scenario: str, n_classes: int, metric: str, path: str,
-                  models: Sequence[str]) -> None:
+                  models: Sequence[str], unit: str = "days") -> None:
     label, scale, fmt = METRIC_LABEL[metric]
     sub = metrics[(metrics["scenario"] == scenario) & (metrics["n_classes"] == n_classes)]
     bh = sub[sub["model"] == "buy_hold"].set_index("horizon")[metric]
@@ -73,8 +73,8 @@ def grid_heatmaps(metrics: pd.DataFrame, scenario: str, n_classes: int, metric: 
         ax.set_xticks(range(len(t.columns)), [str(int(c)) for c in t.columns])
         ax.set_yticks(range(len(t.index)),
                       [f"{int(s)}  (B&H {fmt.format(bh.get(s, np.nan) * scale)})" for s in t.index])
-        ax.set_xlabel("Input window length n (days)", color=INK2, fontsize=9)
-        ax.set_ylabel("Forecast horizon s (days)", color=INK2, fontsize=9)
+        ax.set_xlabel(f"Input window length n ({unit})", color=INK2, fontsize=9)
+        ax.set_ylabel(f"Forecast horizon s ({unit})", color=INK2, fontsize=9)
         ax.set_title(MODEL_LABEL.get(m, m), color=INK, fontsize=11, loc="left")
         _style(ax)
     cbar = fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.85, pad=0.01)
@@ -105,5 +105,51 @@ def equity_curves(curves: Dict[str, pd.Series], bench: pd.Series, title: str, pa
     ax.set_title(title, color=INK, fontsize=11, loc="left")
     ax.legend(frameon=False, fontsize=8, labelcolor=INK, loc="upper left")
     _style(ax)
+    fig.savefig(path, dpi=130, facecolor=SURFACE)
+    plt.close(fig)
+
+
+def learning_curves(metrics: pd.DataFrame, n_classes: int, path: str, models: Sequence[str],
+                    unit: str = "days") -> None:
+    """학습 기간(년) × Buy & Hold 대비 정확도 차이. 예측기간마다 한 칸 + 예측기간 평균 한 칸.
+
+    회색 띠 = 이 평가구간으로 Buy & Hold 와 구분할 수 없는 범위(±최소 확인 가능 차이, α 5% · 검정력 80%). 예측기간
+    평균 칸에는 띠를 그리지 않는다(예측기간끼리 상관이 있어 평균의 잡음 범위를 칸별 값으로 정할 수 없다).
+    """
+    sub = metrics[metrics["n_classes"] == n_classes]
+    if sub.empty:
+        return
+    panels = [(f"s = {int(s)} {unit}", g) for s, g in sub.groupby("horizon")]
+    panels.append(("Mean over horizons", sub.groupby(["model", "train_years"], as_index=False)["edge"].mean()))
+    ncols = min(len(panels), HEATMAP_COLS)
+    nrows = -(-len(panels) // ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(3.6 * ncols + 0.6, 3.0 * nrows), squeeze=False,
+                             facecolor=SURFACE, constrained_layout=True)
+    for ax in axes.ravel()[len(panels):]:
+        ax.set_visible(False)
+    for ax, (title, g) in zip(axes.ravel(), panels):
+        if "mde" in g:
+            band = g.groupby("train_years")["mde"].mean() * 100
+            ax.fill_between(band.index, -band, band, color=GRID, linewidth=0,
+                            label="Not distinguishable from B&H (±MDE)")
+        ax.axhline(0.0, color=INK2, linewidth=1.0)
+        for m, color in zip(models, SERIES):
+            line = g[g["model"] == m].sort_values("train_years")
+            if line.empty:
+                continue
+            ax.plot(line["train_years"], line["edge"] * 100, color=color, linewidth=2.0, marker="o", markersize=3.5,
+                    label=MODEL_LABEL.get(m, m))
+        ax.set_title(title, color=INK, fontsize=10, loc="left")
+        ax.grid(axis="y", color=GRID, linewidth=0.6)
+        _style(ax)
+    for ax in axes[:, 0]:
+        ax.set_ylabel("Accuracy − B&H (pp)", color=INK2, fontsize=9)
+    for ax in axes[-1, :]:
+        ax.set_xlabel("Training window (years)", color=INK2, fontsize=9)
+    handles, labels = axes.ravel()[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="outside lower center", ncol=len(labels), frameon=False, fontsize=8.5,
+               labelcolor=INK)
+    fig.suptitle(f"Learning curve — {n_classes}-class, walk-forward (n = s), same evaluation period", color=INK,
+                 fontsize=12, x=0.01, ha="left")
     fig.savefig(path, dpi=130, facecolor=SURFACE)
     plt.close(fig)
