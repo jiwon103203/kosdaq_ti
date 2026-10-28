@@ -281,8 +281,13 @@ def _ann_torch(X, y, X_test, tr, va, classes, hidden, seeds, max_epochs, patienc
 
 def fit_predict_knn(X: np.ndarray, y: np.ndarray, X_test: np.ndarray, gap: int, n_splits: int = 5,
                     ks: Sequence[int] = KNN_KS) -> Tuple[np.ndarray, Dict]:
-    """kNN. k 를 purged k-fold 정확도로 고른다 (동점이면 작은 k)."""
-    folds = list(purged_kfold(len(X), n_splits, gap))
+    """kNN. k 를 purged k-fold 정확도로 고른다 (동점이면 작은 k). 학습 fold 가 k 보다 작으면 그 k 는 후보에서 뺀다."""
+    folds = [(tr, va) for tr, va in purged_kfold(len(X), n_splits, gap) if len(tr) > 0]
+    smallest = min((len(tr) for tr, _ in folds), default=0)
+    ks = [k for k in ks if k <= smallest] or [min(ks[0], len(X))]
+    if smallest < ks[0]:  # 표본이 너무 적어 교차검증을 못 함 (주간 데이터 · 짧은 학습 기간)
+        k = ks[0]
+        return KNeighborsClassifier(n_neighbors=k).fit(X, y).predict(X_test), {"k": k, "cv_acc": np.nan}
     best = (-np.inf, ks[0])
     for k in ks:
         acc = np.mean([np.mean(KNeighborsClassifier(n_neighbors=k).fit(X[tr], y[tr]).predict(X[va]) == y[va])

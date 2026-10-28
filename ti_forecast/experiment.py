@@ -16,6 +16,7 @@ ARIMA 는 지표 대신 같은 학습 기간의 일간 로그수익률(평가 �
 
 논문 성과지표 (Sec. 6): 매 평가일에 'Up' → s일 매수, 'Down' → s일 매도, 'No Move' → 거래 없음.
     정확도, 승률(수익 거래 비율), 거래당 수익률, Sharpe = sqrt(252/s) · 평균 / 표준편차 (무위험금리 0).
+    주간 데이터(``FREQ_SPECS['W']``)면 s 는 주 단위이고 연율화는 52 를 쓴다.
 겹치는 s일 거래를 독립으로 세므로 낙관적이다. 그래서 매일 신호의 1/s 를 s일 보유하는 tranche 포트폴리오로
 일간 수익률을 만들어(진입 지연 · 거래비용 포함) CAGR · Sharpe · MDD 도 계산한다.
 """
@@ -44,6 +45,25 @@ logger = logging.getLogger(__name__)
 HORIZONS = (1, 3, 5, 7, 10, 15, 20, 25, 30)
 WINDOWS = (3, 5, 7, 10, 15, 20, 25, 30)
 PERIODS_PER_YEAR = 252
+
+
+@dataclass(frozen=True)
+class FreqSpec:
+    """주기별 기본값. 예측기간 · 윈도우 · warmup · 진입 지연은 모두 '기간'(일간 = 거래일, 주간 = 주) 단위다."""
+    periods_per_year: int
+    horizons: Tuple[int, ...]
+    windows: Tuple[int, ...]
+    warmup: int
+    unit: str       # 표 · 로그용 단위 이름
+    unit_en: str    # 그림용
+
+
+# 주간: 예측기간 1주 ~ 1분기, 윈도우 3 ~ 20주. warmup 60주면 Wilder(n = 20) 초기값 비중이 (19/20)^60 ≈ 5% 로,
+# 일간 기본값 120일 · n = 30 의 (29/30)^120 ≈ 2% 와 비슷하다 (4 × 최대 윈도우까지 버리면 주간 표본이 너무 줄어든다).
+FREQ_SPECS = {
+    "D": FreqSpec(252, HORIZONS, WINDOWS, 120, "일", "days"),
+    "W": FreqSpec(52, (1, 2, 3, 4, 6, 8, 13), (3, 4, 6, 8, 10, 13, 20), 60, "주", "weeks"),
+}
 SCENARIOS = ("ohlc_short", "close_short", "close_long")
 
 
@@ -79,8 +99,9 @@ def make_labels(r: np.ndarray, n_classes: int, delta: float = 0.0) -> np.ndarray
 # 성과
 # ---------------------------------------------------------------------------
 
-def paper_metrics(pred: np.ndarray, label: np.ndarray, fwd_ret: np.ndarray, horizon: int) -> Dict[str, float]:
-    """논문 식 15–20: 정확도 · 거래 수 · 승률 · 거래당 수익률 · Sharpe (s일 거래를 연 252/s 회로 연율화).
+def paper_metrics(pred: np.ndarray, label: np.ndarray, fwd_ret: np.ndarray, horizon: int,
+                  periods: int = PERIODS_PER_YEAR) -> Dict[str, float]:
+    """논문 식 15–20: 정확도 · 거래 수 · 승률 · 거래당 수익률 · Sharpe (s기간 거래를 연 ``periods``/s 회로 연율화).
 
     ``acc_se`` 는 겹치는 s일 레이블을 감안한 정확도 표준오차 근사 sqrt(p(1-p) / (N/s)) — 독립 표본이 N/s 개쯤이다.
     """
@@ -94,7 +115,7 @@ def paper_metrics(pred: np.ndarray, label: np.ndarray, fwd_ret: np.ndarray, hori
         "n_trades": int(trade.sum()),
         "win_rate": float(np.mean(pnl > 0)) if len(pnl) else np.nan,
         "ret_per_trade": float(pnl.mean()) if len(pnl) else np.nan,
-        "sharpe": float(np.sqrt(PERIODS_PER_YEAR / horizon) * pnl.mean() / sd) if sd and sd > 0 else np.nan,
+        "sharpe": float(np.sqrt(periods / horizon) * pnl.mean() / sd) if sd and sd > 0 else np.nan,
         "frac_up": float(np.mean(pred == 1)),
     }
 
@@ -106,7 +127,10 @@ def max_drawdown(ret: pd.Series) -> float:
 
 def performance_metrics(ret: pd.Series, weight: Optional[pd.Series] = None,
                         periods: int = PERIODS_PER_YEAR) -> Dict[str, float]:
-    """일간 수익률의 CAGR · 변동성 · Sharpe · Sortino · MDD · Calmar (무위험금리 0) (+ 비중 평균 · 회전율)."""
+    """기간(일간 · 주간) 수익률의 CAGR · 변동성 · Sharpe · Sortino · MDD · Calmar (무위험금리 0) (+ 비중 평균 · 회전율).
+
+    ``periods`` = 1년의 기간 수 (일간 252, 주간 52).
+    """
     ret = ret.dropna()
     n = len(ret)
     if n == 0:
@@ -211,7 +235,7 @@ def training_rows(p: Prepared, s: int, cutoff: pd.Timestamp, first: Optional[pd.
     end = label_end_dates(p.close.index, s).reindex(p.dates)
     keep = (end < cutoff).to_numpy()
     if first is not None:
-        keep &= (p.dates >= first)
+        keep = keep & (p.dates >= first)  # to_numpy() 가 읽기 전용일 수 있어 제자리 연산을 쓰지 않는다
     return p.dates[keep]
 
 
@@ -348,18 +372,19 @@ def grid_jobs(prepared: Sequence[Prepared], test: pd.DatetimeIndex, models: Sequ
     return jobs, thresholds
 
 
-def grid_metrics(jobs: Sequence[Job], results: Dict, test: pd.DatetimeIndex) -> pd.DataFrame:
+def grid_metrics(jobs: Sequence[Job], results: Dict, test: pd.DatetimeIndex,
+                 periods: int = PERIODS_PER_YEAR) -> pd.DataFrame:
     """설정마다 논문 지표 + 같은 평가구간의 Buy & Hold (항상 'Up')."""
     rows, seen = [], set()
     for job in jobs:
         meta = job.meta
         pred, info = results[job.key]
         row = {k: meta[k] for k in ("scenario", "model", "n_classes", "horizon", "window")}
-        rows.append({**row, **paper_metrics(pred, meta["y_te"], meta["r_te"], meta["horizon"]), **info})
+        rows.append({**row, **paper_metrics(pred, meta["y_te"], meta["r_te"], meta["horizon"], periods), **info})
         bh_key = (meta["scenario"], meta["n_classes"], meta["horizon"])
         if bh_key not in seen:
             seen.add(bh_key)
-            bh = paper_metrics(np.ones(len(test), dtype=int), meta["y_te"], meta["r_te"], meta["horizon"])
+            bh = paper_metrics(np.ones(len(test), dtype=int), meta["y_te"], meta["r_te"], meta["horizon"], periods)
             rows.append({**row, "model": "buy_hold", "window": np.nan, **bh})
     return pd.DataFrame(rows)
 
@@ -414,7 +439,8 @@ def window_pattern(metrics: pd.DataFrame, columns=("accuracy", "win_rate", "ret_
 
 
 def portfolio_table(pred: pd.DataFrame, close: pd.Series, delay: int, cost_bps: float,
-                    keys=("scenario", "model", "n_classes", "horizon", "window")) -> pd.DataFrame:
+                    keys=("scenario", "model", "n_classes", "horizon", "window"),
+                    periods: int = PERIODS_PER_YEAR) -> pd.DataFrame:
     """설정마다 tranche 포트폴리오(롱숏 · 롱온리) 성과 + 시나리오별 같은 기간 Buy & Hold."""
     rows = []
     for key, g in pred.groupby(list(keys)):
@@ -423,12 +449,12 @@ def portfolio_table(pred: pd.DataFrame, close: pd.Series, delay: int, cost_bps: 
         for mode, long_only in (("long_short", False), ("long_only", True)):
             bt = tranche_backtest(sig, close, s, delay=delay, cost_bps=cost_bps, long_only=long_only)
             rows.append({**dict(zip(keys, key)), "mode": mode,
-                         **performance_metrics(bt["strat_ret"], weight=bt["weight"])})
+                         **performance_metrics(bt["strat_ret"], weight=bt["weight"], periods=periods)})
     for name, g in pred.groupby("scenario"):
         dates = pd.DatetimeIndex(np.sort(g["date"].unique()))
         bh = close.reindex(dates).pct_change().iloc[1:]
         rows.append({"scenario": name, "model": "buy_hold", "mode": "long_only",
-                     **performance_metrics(bh, weight=pd.Series(1.0, index=bh.index))})
+                     **performance_metrics(bh, weight=pd.Series(1.0, index=bh.index), periods=periods)})
     return pd.DataFrame(rows)
 
 
@@ -489,7 +515,8 @@ def walk_forward_predictions(jobs: Sequence[Job], results: Dict, prepared: Dict[
     return pd.concat(frames, ignore_index=True).sort_values(["scenario", "model", "n_classes", "horizon", "date"])
 
 
-def walk_forward_metrics(pred: pd.DataFrame, start: Optional[pd.Timestamp] = None) -> pd.DataFrame:
+def walk_forward_metrics(pred: pd.DataFrame, start: Optional[pd.Timestamp] = None,
+                         periods: int = PERIODS_PER_YEAR) -> pd.DataFrame:
     """walk-forward 예측의 논문 지표 (레이블이 확정된 날만) + Buy & Hold."""
     if start is not None:
         pred = pred[pred["date"] >= start]
@@ -499,7 +526,7 @@ def walk_forward_metrics(pred: pd.DataFrame, start: Optional[pd.Timestamp] = Non
         y, r, s = g["label"].to_numpy().astype(int), g["fwd_ret"].to_numpy(), int(key[3])
         base = dict(zip(["scenario", "model", "n_classes", "horizon", "window"], key))
         rows.append({**base, "start": g["date"].min().date(), "end": g["date"].max().date(),
-                     **paper_metrics(g["pred"].to_numpy(), y, r, s)})
+                     **paper_metrics(g["pred"].to_numpy(), y, r, s, periods)})
         rows.append({**base, "model": "buy_hold", "start": g["date"].min().date(), "end": g["date"].max().date(),
-                     **paper_metrics(np.ones(len(g), dtype=int), y, r, s)})
+                     **paper_metrics(np.ones(len(g), dtype=int), y, r, s, periods)})
     return pd.DataFrame(rows).drop_duplicates(subset=["scenario", "model", "n_classes", "horizon"])

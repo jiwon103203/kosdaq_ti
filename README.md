@@ -15,6 +15,9 @@ python run_ti_forecast.py data/kosdaq150.xlsx --models svm --skip-wf  # 그리�
 python run_ti_forecast.py data/kosdaq150.xlsx --scenarios close_long --skip-grid --cost-bps 5
 python run_ti_forecast.py data/kosdaq150.xlsx --models rf,xgb,lgbm,logit,arima  # 트리 계열 · 계량 모형
 python run_ti_forecast.py data/kosdaq150.xlsx --models all --ann-backend torch --device cuda --svm-backend cuml  # GPU
+python run_ti_forecast.py data/kosdaq150.xlsx --freq W               # 주간 (일간 입력을 주간으로 바꿈)
+python run_learning_curve.py data/kosdaq150.xlsx                     # 학습 곡선: 학습 1·2·3·5·7·10년 비교
+python run_learning_curve.py data/kosdaq150.xlsx --freq W --train-years 1,2,3,5,8
 pytest tests                                                         # 지표 식 · 미래 정보 미사용 · 분할 규칙
 ```
 
@@ -106,6 +109,55 @@ pytest tests                                                         # 지표 �
 - 표본이 작아서(최대 약 3,100일 × 지표 10개) GPU는 큰 데이터에서만큼 빨라지지 않습니다. 커널 실행 · 데이터 복사 고정비가 학습 시간과 비슷하기 때문입니다. 가장 확실한 가속은 코어 수(`--n-jobs`)와 캐시입니다. GPU 경로(`--device cuda`, `--svm-backend cuml`)는 GPU가 없는 환경에서 만들어 GPU에서는 아직 실행해 보지 않았습니다.
 - 캐시: backend · device가 기본값(sklearn · cpu)이 아니면 캐시 파일 이름에 붙습니다(`..._torch.pkl`, `..._cuda.pkl`). 기본 설정의 캐시 이름은 예전과 같아서, 이미 돌려 둔 SVM · ANN · kNN 결과를 그대로 다시 씁니다.
 
+## 주간 데이터 (`--freq W`)
+
+`--freq`는 `auto`(기본, 입력 날짜 간격의 중앙값이 4일 이상이면 주간), `D`, `W` 중 하나입니다. `W`에 일간 입력을 주면 월~금 한 주로 묶어 주간 가격을 만듭니다. 날짜는 그 주 마지막 거래일, 시가는 첫 거래일 시가, 고가·저가는 주중 최고·최저, 종가는 마지막 거래일 종가입니다. 주중 하루라도 시가·고가·저가가 없으면 그 주는 종가 전용으로 둡니다. 주간 파일을 직접 넣어도 됩니다(`auto`가 주간으로 인식하고, `--freq D`로 주면 멈춥니다).
+
+주간이면 예측기간 · 윈도우 · warmup · 진입 지연(`--delay`)이 모두 **주 단위**이고, 연율화(Sharpe · CAGR · 변동성 · 회전율)는 252 대신 52를 씁니다. 지정하지 않은 값은 주기별 기본값을 씁니다.
+
+| | 일간 (`D`) | 주간 (`W`) |
+|---|---|---|
+| 예측기간 s | 1, 3, 5, 7, 10, 15, 20, 25, 30일 | 1, 2, 3, 4, 6, 8, 13주 |
+| 입력 윈도우 n | 3, 5, 7, 10, 15, 20, 25, 30일 | 3, 4, 6, 8, 10, 13, 20주 |
+| warmup | 120일 | 60주 (Wilder n = 20 초기값 비중 약 5%) |
+| 1년 | 252 | 52 |
+
+주간으로 바꾸면 표본이 1/5로 줄어듭니다(코스닥150 종가 기준 약 4,000일 → 약 850주, OHLC 구간 약 590주). 그래서 평가구간의 정확도 표준오차가 1주 예측에서도 약 4%p, 4주 예측에서는 약 8%p입니다. 같은 기간을 예측한다면 독립 표본 수는 일간 데이터에서 s = 5로 예측할 때와 거의 같고, 학습 행 수만 줄어듭니다. 주 단위 예측이 목적이라면 일간 데이터에 `--horizons 5,10,20`처럼 주는 쪽이 보통 낫습니다. 이 차이는 아래 학습 곡선으로 직접 비교할 수 있습니다.
+
+## 학습 곡선 (`run_learning_curve.py`)
+
+학습 데이터가 얼마나 있어야 하는지 보려고, **같은 평가구간**에서 학습 기간만 바꿔 walk-forward 성과를 비교합니다.
+
+- 매년 첫 표본 날짜에 **최근 k년**(rolling, `--train-years`, 기본 1, 2, 3, 5, 7, 10)으로 다시 학습해 그 해를 예측합니다. 입력 윈도우는 n = s입니다.
+- 평가 첫해는 가장 긴 학습 기간이 표본 안에 들어가는 해입니다(`--eval-start-year`로 바꿀 수 있음). 그래서 학습 기간마다 평가일이 같습니다. 기본 시나리오는 표본이 가장 긴 `close_long`(`--scenario`)이고, 기본 모델은 빠른 `logit,knn,ann`입니다(SVM은 `--models`로 추가).
+- 3 클래스는 δ를 학습구간에서 정하므로 학습 기간마다 평가 레이블이 조금 다릅니다. `edge`는 같은 레이블의 Buy & Hold와 비교한 값이라 학습 기간끼리 비교할 수 있습니다.
+
+| 열 | 뜻 |
+|---|---|
+| `edge` | 정확도 − Buy & Hold(항상 Up) 정확도 |
+| `mde` | 이 평가구간으로 확인할 수 있는 최소 차이. 독립 표본 N/s개, α 5%(양측), 검정력 80%: 2.8 · √(p(1−p)/(N/s)) |
+| `cv_acc`, `cv_gap` | 학습구간 교차검증 정확도와 평가 정확도의 차이. 크면 표본이 적어 하이퍼파라미터가 잡음에 맞춰진 것 |
+| `n_train`, `n_train_independent` | 학습 행 수와 독립 표본 근사(n_train / s) |
+| `beats_bh`, `significant` | edge > 0인 예측기간 비율, edge > mde인 예측기간 비율 |
+
+읽는 법: 곡선이 학습 기간에 따라 오르면 데이터가 더 있으면 나아질 여지가 있습니다. 평평하거나 회색 띠(±mde, 잡음 범위) 안에 머물면 데이터를 늘리는 것만으로는 나아지지 않습니다. 긴 학습 기간이 오히려 나쁘면 시장 성격이 바뀌어(비정상성) 오래된 데이터가 방해가 되는 것일 수 있습니다.
+
+`summary.md`와 `lc_sample_size.csv`에는 엣지 d를 확인하는 데 필요한 독립 표본 수 (1.96 + 0.84)² · p(1−p) / d²와, 예측기간 s로 그만큼 쌓는 데 걸리는 기간도 들어 있습니다(정확도 50% 근처).
+
+| 엣지 d | 독립 표본 | 일간 s = 1 | 일간 s = 5 | 주간 s = 1 | 일간 s = 20 | 주간 s = 4 |
+|---|---|---|---|---|---|---|
+| 5%p | 약 785 | 3.1년 | 15.6년 | 15.1년 | 62년 | 60년 |
+| 3%p | 약 2,180 | 8.7년 | 43년 | 42년 | 173년 | 168년 |
+| 2%p | 약 4,900 | 19.5년 | 97년 | 94년 | 389년 | 377년 |
+
+| 파일 | 내용 |
+|---|---|
+| `summary.md` | 표본 · 평가구간, 학습 기간 × 모델 edge, 예측기간 평균 요약, 예측기간별 edge · mde, 필요한 표본 수 |
+| `lc_metrics.csv`, `lc_summary.csv` | (학습 기간, 모델, 클래스 수, 예측기간)별 지표와 예측기간 평균 |
+| `lc_sample_size.csv` | 엣지별 필요한 독립 표본 수와 기간(년) |
+| `learning_curve_c*.png` | 학습 기간 × Buy & Hold 대비 정확도 차이 (예측기간별 칸 + 평균 칸, 회색 띠 = ±mde) |
+| `lc_predictions.csv.gz` | 기간별 예측 |
+
 ## 논문과 다르게 한 것
 
 - **교차검증 fold**: 시간 순서 블록으로 나누고, 레이블 구간 (t, t+s]가 검증 블록과 겹치는 학습 표본을 버립니다(purged k-fold). 무작위 fold는 겹치는 레이블 때문에 검증 정확도가 부풀어 과적합된 하이퍼파라미터를 고릅니다. 학습/평가 경계에서도 레이블이 평가구간에 걸치는 마지막 s개 학습 표본을 버립니다.
@@ -155,11 +207,13 @@ pytest tests                                                         # 지표 �
 
 ```
 run_ti_forecast.py      진입점 (CLI)
+run_learning_curve.py   학습 곡선 (학습 기간별 walk-forward)
 ti_forecast/
-  data.py               DataGuide 엑셀 / csv → 시가·고가·저가·종가
+  data.py               DataGuide 엑셀 / csv → 시가·고가·저가·종가, 일간 → 주간
   indicators.py         10개 기술지표 (OHLC 원식 · 종가 전용)
   models.py             SVM · ANN · kNN + RF · XGBoost · LightGBM · 로짓 · ARIMA, purged k-fold 하이퍼파라미터 선택
-  experiment.py         레이블 · 분할 · 논문 지표 · tranche 백테스트 · 그리드 · walk-forward
+  experiment.py         레이블 · 분할 · 논문 지표 · tranche 백테스트 · 그리드 · walk-forward, 주기별 기본값
+  learning_curve.py     학습 곡선 작업 · 지표, 필요한 표본 수
   plotting.py           히트맵 · 누적수익률
-tests/                  지표 식 · 미래 정보 미사용 · 분할 · 백테스트 · 전체 실행
+tests/                  지표 식 · 미래 정보 미사용 · 분할 · 백테스트 · 주간 변환 · 학습 곡선 · 전체 실행
 ```
